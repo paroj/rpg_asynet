@@ -34,7 +34,7 @@ def visualizeEventsTime(events, height, width, path_name=None, last_k_events=Non
         plt.close()
 
 
-def visualizeLocations(locations, shape, path_name=None, features=None, bounding_box=None, class_name=None):
+def visualizeLocations(locations, shape, path_name=None, features=None, bounding_box=None, class_name=None, rescale_image=True):
     """Visualizes changing locations in a histogram. No time dependency"""
     np_image = np.zeros([shape[0], shape[1], 3])
 
@@ -52,7 +52,7 @@ def visualizeLocations(locations, shape, path_name=None, features=None, bounding
                                                                        axis=-1)
 
     if bounding_box is not None:
-        np_image = drawBoundingBoxes(np_image, bounding_box, class_name)
+        np_image = drawBoundingBoxes(np_image, bounding_box, class_name, rescale_image=rescale_image)
 
     if path_name is None:
         return np_image
@@ -122,10 +122,12 @@ def visualizeConfusionMatrix(confusion_matrix, path_name=None):
 def drawBoundingBoxes(np_image, bounding_boxes, class_name, ground_truth=True, rescale_image=True):
     """Draws the bounding boxes in the image"""
     resize_scale = 1.5
-    bounding_boxes[:, :4] = (bounding_boxes.astype(np.float64)[:, :4] * resize_scale).astype(np.int)
     if rescale_image:
+        bounding_boxes[:, :4] = (bounding_boxes.astype(np.float64)[:, :4] * resize_scale).astype(np.int)
         new_dim = np.array(np_image.shape[:2], dtype=np.float) * resize_scale
         np_image = cv2.resize(np_image, tuple(new_dim.astype(int)[::-1]), interpolation=cv2.INTER_NEAREST)
+    else:
+        bounding_boxes[:, :4] = (bounding_boxes.astype(np.float64)[:, :4]).astype(np.int)
 
     for i, bounding_box in enumerate(bounding_boxes):
         if bounding_box.sum() == 0:

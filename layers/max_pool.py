@@ -19,14 +19,24 @@ class asynMaxPool:
         self.first_layer = first_layer
         self.device = device
 
-        self.padding = [filter_size // 2] * dimension * 2
+        # self.padding = [filter_size // 2] * dimension * 2
         self.filter_size_tensor = torch.LongTensor(dimension).fill_(self.filter_size).to(device)
         # Construct lookup table for 1d kernel position to position in nd
         kernel_indices = torch.stack(torch.meshgrid([torch.arange(filter_size) for _ in range(dimension)]), dim=-1)
         self.filter_volume = self.filter_size_tensor.prod().item()
         self.kernel_indices = kernel_indices.reshape([self.filter_volume, dimension]).to(device)
         self.border_dist = filter_size // 2 if padding_mode == 'valid' else 0
+        # define per-sample state accumulators
+        self.output_feature_map = None
+        self.old_max_indices_map = None
+        self.output_arguments_map = None
 
+    def reset(self):
+        """
+        resets the per-sample state in preparation of processing a new sample
+        :return: nothing
+        """
+        # define per-sample state accumulators
         self.output_feature_map = None
         self.old_max_indices_map = None
         self.output_arguments_map = None
@@ -40,19 +50,28 @@ class asynMaxPool:
         :return:
         """
         self.checkInputArguments(update_location, feature_map)
-        update_location_indices = update_location.split(1, dim=-1)
+
+        # update_location_indices = update_location.split(1, dim=-1)
+        # TODO check
+        # output_spatial_shape = (torch.tensor(feature_map.shape[:-1], device=self.device).float() -
+        #                         self.border_dist*2) / self.filter_stride
         output_spatial_shape = (torch.tensor(feature_map.shape[:-1], device=self.device).float() -
-                                self.border_dist*2) / self.filter_stride
+                                self.border_dist*2 + (self.filter_size + 1) % 2) / self.filter_stride
         output_spatial_shape = torch.ceil(output_spatial_shape).long()
         if self.output_arguments_map is None:
             out_arg_shape = list(output_spatial_shape) + [self.filter_volume] + [feature_map.shape[-1]]
-            self.output_arguments_map = torch.zeros(torch.Size(out_arg_shape), device=self.device)
+            self.output_arguments_map = torch.zeros(torch.Size(out_arg_shape), device=self.device).double()
         if self.output_feature_map is None:
             self.output_feature_map = torch.zeros(list(output_spatial_shape) + [feature_map.shape[-1]],
-                                                  device=self.device)
+                                                  device=self.device).double()
         if self.old_max_indices_map is None:
             self.old_max_indices_map = torch.ones(list(output_spatial_shape) + [feature_map.shape[-1], self.dimension],
                                                   device=self.device).long() * -1
+
+        # TODO
+        if update_location.nelement() == 0:
+            new_update_events = torch.empty([0, self.dimension]).double()
+            return new_update_events, self.output_feature_map.clone(), self.old_max_indices_map.clone()
 
         # Find output locations
         out = self.computeOutputLocations(update_location, output_spatial_shape)
@@ -67,7 +86,7 @@ class asynMaxPool:
         argument_indices = torch.cat((output_locations, dummy_kernel_indices[:, None]), dim=-1).long().split(1, dim=-1)
         input_locations = update_location[:, None, :].repeat([1, self.filter_volume, 1])
         input_locations = input_locations.view(-1, self.dimension)[valid_locations, :]
-        self.output_arguments_map[argument_indices] = feature_map[input_locations.split(1, dim=-1)].float()
+        self.output_arguments_map[argument_indices] = feature_map[input_locations.split(1, dim=-1)]
 
         n_Channels = self.output_arguments_map.shape[-1]
         zero_added_output_arguments_map = torch.cat((torch.zeros(list(output_spatial_shape) + [1, n_Channels],
@@ -75,6 +94,10 @@ class asynMaxPool:
                                                      self.output_arguments_map), dim=-2)
 
         output_indices = argument_indices[:1]
+        # TODO
+        if len(output_indices) == 0:
+            new_update_events = torch.empty([0, self.dimension]).double()
+            return new_update_events, self.output_feature_map.clone(), self.old_max_indices_map.clone()
         out = torch.max(zero_added_output_arguments_map[output_indices], dim=-2)
         self.output_feature_map[output_indices], max_indices = out
         self.old_max_indices_map[output_indices] = self.computeMaxIndices(max_indices, output_spatial_shape,
@@ -88,7 +111,7 @@ class asynMaxPool:
 
     def computeOutputLocations(self, update_location, output_spatial_shape):
         """Computes the outpout location based on the input shape, stride and padding mode"""
-        output_locations = update_location[:, None, :] + self.kernel_indices[None, :, :] - self.filter_size // 2
+        output_locations = update_location[:, None, :] + self.kernel_indices[None, :, :] - (self.filter_size - 1) // 2
         # Adjust for padding mode and stride
         output_locations = (output_locations - self.border_dist).float() / self.filter_stride
         nr_update_locations = output_locations.shape[0]
@@ -127,3 +150,6 @@ class asynMaxPool:
         if feature_map.ndim != self.dimension + 1:
             raise ValueError('Expected feature_map to have shape [Spatial_1, Spatial_2, ..., C]. Got size %s' %
                              list(feature_map.shape))
+
+    def __str__(self):
+        return f"AsynMaxPooling{self.filter_size}/{self.filter_stride}"

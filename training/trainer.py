@@ -1,4 +1,5 @@
 import os
+import sys
 import abc
 import tqdm
 import torch
@@ -11,6 +12,8 @@ import dataloader.dataset
 from dataloader.loader import Loader
 from models.facebook_sparse_vgg import FBSparseVGG
 from models.facebook_sparse_object_det import FBSparseObjectDet
+from yolo.model_sparse import SparseYolo
+from yolo.model import Darknet as DenseYolo, build_darknet as create_dense_yolo
 from models.dense_VGG import DenseVGG
 from models.dense_object_det import DenseObjectDet
 from models.yolo_loss import yoloLoss
@@ -37,6 +40,8 @@ class AbstractTrainer(abc.ABC):
 
         if self.settings.event_representation == 'histogram':
             self.nr_input_channels = 2
+        elif self.settings.event_representation == 'dense_image':
+            self.nr_input_channels = 3
         elif self.settings.event_representation == 'event_queue':
             self.nr_input_channels = 30
 
@@ -47,17 +52,38 @@ class AbstractTrainer(abc.ABC):
         self.createDatasets()
 
         self.buildModel()
-        self.optimizer = optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()),
-                                    lr=self.settings.init_lr)
 
-        if settings.steps_lr is not None:
-            self.scheduler = torch.optim.lr_scheduler.MultiStepLR(self.optimizer, milestones=settings.steps_lr,
-                                                                  gamma=settings.factor_lr)
         if settings.resume_training:
+            try:
+                self.epoch_step = int(self.settings.resume_ckpt_file.split('_')[-1].split('.')[0])
+            except (TypeError, IndexError):
+                print("WARNING: unable to recover training epoch.")
+                self.epoch_step = 0
+            # recover best_so_far checkpoint and accuracy
+            self.recover_best_checkpoint()
+            # recover scheduler state
+            remaining_steps_lr = [step - self.epoch_step for step in self.settings.steps_lr if step > self.epoch_step]
+            missed_step_count = len([step for step in self.settings.steps_lr if step <= self.epoch_step])
+            initial_lr = self.settings.init_lr * (self.settings.factor_lr ** missed_step_count)
+            self.optimizer = optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()),
+                                        lr=initial_lr)
+            if settings.steps_lr is not None:
+                self.scheduler = torch.optim.lr_scheduler.MultiStepLR(self.optimizer, milestones=remaining_steps_lr,
+                                                                      gamma=self.settings.factor_lr)
+            print(f"trying to load checkpoint at '{self.settings.resume_ckpt_file}'...")
             self.loadCheckpoint(self.settings.resume_ckpt_file)
+            print("checkpoint loaded successfully.")
+        else:
+            self.epoch_step = 0
+            self.best_checkpoint = None
+            self.optimizer = optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()),
+                                        lr=self.settings.init_lr)
+
+            if settings.steps_lr is not None:
+                self.scheduler = torch.optim.lr_scheduler.MultiStepLR(self.optimizer, milestones=settings.steps_lr,
+                                                                  gamma=self.settings.factor_lr)
 
         self.batch_step = 0
-        self.epoch_step = 0
         self.training_loss = 0
         self.val_batch_step = 0
         self.validation_loss = 0
@@ -69,6 +95,7 @@ class AbstractTrainer(abc.ABC):
         # tqdm progress bar
         self.pbar = None
 
+
     @abc.abstractmethod
     def buildModel(self):
         """Model is constructed in child class"""
@@ -76,13 +103,15 @@ class AbstractTrainer(abc.ABC):
 
     def createDatasets(self):
         """
-        Creates the validation and the training data based on the lists specified in the config/settings.yaml file.
+        Creates the validation and the training data based on the lists specified in the config/settings_default.yaml file.
         """
         train_dataset = self.dataset_builder(self.settings.dataset_path,
                                              self.settings.object_classes,
                                              self.settings.height,
                                              self.settings.width,
+                                             self.settings.event_window_mode,
                                              self.settings.nr_events_window,
+                                             self.settings.timeframe_events_window,
                                              augmentation=True,
                                              mode='training',
                                              event_representation=self.settings.event_representation)
@@ -95,7 +124,9 @@ class AbstractTrainer(abc.ABC):
                                            self.settings.object_classes,
                                            self.settings.height,
                                            self.settings.width,
+                                           self.settings.event_window_mode,
                                            self.settings.nr_events_window,
+                                           self.settings.timeframe_events_window,
                                            mode='validation',
                                            event_representation=self.settings.event_representation)
         self.nr_val_epochs = int(val_dataset.nr_samples / self.settings.batch_size) + 1
@@ -211,10 +242,39 @@ class AbstractTrainer(abc.ABC):
         else:
             print("=> no checkpoint found at '{}'".format(filename))
 
-    def saveCheckpoint(self):
+    def saveCheckpoint(self, best_so_far: bool = False):
+        """
+        save the current weights of the model, only keep best_so_far and latest checkpoint
+        :param best_so_far: best checkpoint, keep until better found
+        :return:
+        """
+        if self.settings.discard_suboptimal_checkpoints:
+            old_checkpoints = os.listdir(self.settings.ckpt_dir)
+            old_checkpoints = [
+                file
+                for file
+                in old_checkpoints
+                if file.endswith('.pth') and (file != self.best_checkpoint or best_so_far)
+            ]
+            for file in old_checkpoints:
+                os.remove(os.path.join(self.settings.ckpt_dir, file))
         file_path = os.path.join(self.settings.ckpt_dir, 'model_step_' + str(self.epoch_step) + '.pth')
+        if best_so_far:
+            self.best_checkpoint = file_path
         torch.save({'state_dict': self.model.state_dict(), 'optimizer': self.optimizer.state_dict(),
                     'epoch': self.epoch_step}, file_path)
+        with open(os.path.join(self.settings.ckpt_dir, "best_so_far.txt"), 'w') as f:
+            f.write(f"{self.best_checkpoint}\n")
+            f.write(f"{self.max_validation_accuracy}\n")
+
+    def recover_best_checkpoint(self):
+        print("Recovering best-so-far checkpoint and accuracy...")
+        with open(os.path.join(self.settings.ckpt_dir, "best_so_far.txt"), 'r') as f:
+            lines = f.readlines()
+        self.best_checkpoint = os.path.split(lines[0].strip())[1]
+        self.max_validation_accuracy = float(lines[1].strip())
+        print("Done.")
+
 
 
 class FBSparseVGGModel(AbstractTrainer):
@@ -476,23 +536,48 @@ class SparseObjectDetModel(AbstractTrainer):
 
     def train(self):
         """Main training and validation loop"""
-        validation_step = 50 - 48 * (self.settings.dataset_name == 'Prophesee')
+        # validation_step = 50 - 48 * (self.settings.dataset_name == 'Prophesee' or self.settings.dataset_name == 'Kitty_ObjectDetection')
+        validation_step = 2  # TODO
 
-        while True:
+        early_stopping_counter = 0
+        early_stopping_patience = 40  # validation steps TODO
+
+        best_validation_accuracy = 0
+
+        while self.epoch_step < self.settings.max_epochs:
+            print(f"EPOCH {self.epoch_step+1}:")
             self.trainEpoch()
             if (self.epoch_step % validation_step) == (validation_step - 1):
+                print(f"VAL EPOCH:")
                 self.validationEpoch()
+                print(f"VAL ACCURACY: {self.validation_accuracy}, best so far={self.max_validation_accuracy}")
+                if self.validation_accuracy <= best_validation_accuracy:  # TODO comparing to nan always returns false
+                    early_stopping_counter += 1
+                    print(f"\t{early_stopping_counter} val epochs since global maximum.")
+                    if early_stopping_counter >= early_stopping_patience:
+                        # early stopping
+                        print("EARLY STOPPING TRIGGERED, EXITING.")
+                        break
+                else:
+                    print("\tnew best.")
+                    early_stopping_counter = 0
+                    best_validation_accuracy = self.validation_accuracy
 
             self.epoch_step += 1
             self.scheduler.step()
 
+        if self.epoch_step == self.settings.max_epochs:
+            self.saveCheckpoint()
+
     def trainEpoch(self):
-        self.pbar = tqdm.tqdm(total=self.nr_train_epochs, unit='Batch', unit_scale=True)
+        self.pbar = tqdm.tqdm(total=self.nr_train_epochs, unit='Batch', unit_scale=True, file=sys.stdout)
         self.model = self.model.train()
         loss_function = yoloLoss
 
         for i_batch, sample_batched in enumerate(self.train_loader):
-            event, bounding_box, histogram = sample_batched
+            # print("0 0")
+            event, bounding_box, histogram = sample_batched  # debug TODO
+            # event, bounding_box, histogram, name = sample_batched  # debug TODO
             self.optimizer.zero_grad()
 
             # Change size to input size of sparse VGG
@@ -505,17 +590,68 @@ class SparseObjectDetModel(AbstractTrainer):
             bounding_box[:, :, [1, 3]] = (bounding_box[:, :, [1, 3]] * self.model_input_size[0].float()
                                        / self.settings.height).long()
             locations, features = self.denseToSparse(histogram)
-
+            # print("0 1")
             # Deep Learning Magic
+            # print(f"self.model_input_size: {self.model_input_size}")
+            # print(f"locations.shape: {locations.shape}")
+            # print(f"features.shape: {features.shape}")
+            # print(f"histogram.shape: {histogram.shape}")
             model_output = self.model([locations, features, histogram.shape[0]])
+            # print(f"model_output.shape: {model_output.shape}")
             out = loss_function(model_output, bounding_box, self.model_input_size)
             loss = out[0]
 
+            # print("0 2")
             # Write losses statistics
             self.storeLossesObjectDetection(out)
 
             loss.backward()
             self.optimizer.step()
+
+            # debug TODO
+            if loss > 1e+5 and len([file for file in os.listdir("/code") if file.endswith(".dump")]) < 5:
+                print(f"HIGH LOSS SAMPLE DETECTED: total_loss {loss}, confidence_loss {out[3]}")
+                # name = [
+                #     ''.join([chr(c) for c in n])
+                #     for n
+                #     in name
+                # ]
+                # dumpfile_name = f"epoch_{self.epoch_step}_{name[0]}.dump"
+                # print(f"DUMPING SAMPLE: {dumpfile_name}")
+                # images = []
+                # for i in range(len(name)):
+                #     # batch_one_mask = locations[:, -1] == i
+                #     vis_locations = locations[:, :2]
+                #     features = features[:, :]
+                #     with torch.no_grad():
+                #         detected_bbox = yoloDetect(model_output, self.model_input_size.to(model_output.device),
+                #                                    threshold=0.3).long().cpu().numpy()
+                #         detected_bbox = detected_bbox[detected_bbox[:, 0] == 0, 1:-2]
+                #     image = visualizations.visualizeLocations(vis_locations.cpu().int().numpy(), self.model_input_size,
+                #                                               features=features.cpu().numpy(),
+                #                                               bounding_box=bounding_box[0, :, :].cpu().numpy(),
+                #                                               class_name=[self.object_classes[i]
+                #                                                           for i in bounding_box[0, :, -1]])
+                #     image = visualizations.drawBoundingBoxes(image, detected_bbox[:, :-1],
+                #                                              class_name=[self.object_classes[i]
+                #                                                          for i in detected_bbox[:, -1]],
+                #                                              ground_truth=False, rescale_image=False)
+                #     images.append(image)
+                # import pickle
+                # with open(f"/code/{dumpfile_name}", "wb") as f:
+                #     pickle.dump(
+                #         {
+                #             "file": name,
+                #             "events": event.to('cpu'),
+                #             "bounding_boxes": bounding_box.to('cpu'),
+                #             "size": self.model_input_size.to('cpu'),
+                #             "histogram": histogram.to('cpu'),
+                #             "loss": [elem.to('cpu') for elem in out],
+                #             "prediction": model_output.to('cpu'),
+                #             "images": images
+                #         },
+                #         f
+                #     )
 
             if self.batch_step % (self.nr_train_epochs * 50) == 0:
                 batch_one_mask = locations[:, -1] == 0
@@ -545,15 +681,19 @@ class SparseObjectDetModel(AbstractTrainer):
                                                          ground_truth=False, rescale_image=False)
                 self.writer.add_image('Training/Input Histogram', image, self.epoch_step, dataformats='HWC')
 
+            # print(f"\tstep {i_batch}/{len(self.train_loader)}: TrainLoss={loss.data.cpu().numpy()}")
             self.pbar.set_postfix(TrainLoss=loss.data.cpu().numpy())
             self.pbar.update(1)
+            # print something to force tqdm to flush the progress bar
+            print(" ")
+            self.pbar.refresh()
             self.batch_step += 1
 
         self.writer.add_scalar('Training/Learning_Rate', self.getLearningRate(), self.epoch_step)
         self.pbar.close()
 
     def validationEpoch(self):
-        self.pbar = tqdm.tqdm(total=self.nr_val_epochs, unit='Batch', unit_scale=True)
+        self.pbar = tqdm.tqdm(total=self.nr_val_epochs, unit='Batch', unit_scale=True, file=sys.stdout)
         self.resetValidation()
         self.model = self.model.eval()
         self.bounding_boxes = BoundingBoxes()
@@ -562,7 +702,8 @@ class SparseObjectDetModel(AbstractTrainer):
         val_images = np.zeros([2, int(self.model_input_size[0]*1.5), int(self.model_input_size[1]*1.5), 3])
 
         for i_batch, sample_batched in enumerate(self.val_loader):
-            event, bounding_box, histogram = sample_batched
+            # event, bounding_box, histogram, _ = sample_batched
+            event, bounding_box, histogram = sample_batched  # TODO
 
             # Convert spatial dimension to model input size
             histogram = torch.nn.functional.interpolate(histogram.permute(0, 3, 1, 2),
@@ -606,6 +747,9 @@ class SparseObjectDetModel(AbstractTrainer):
 
             self.pbar.set_postfix(ValLoss=loss.data.cpu().numpy())
             self.pbar.update(1)
+            # print something to force tqdm to flush the progress bar
+            print(" ")
+            self.pbar.refresh()
             self.val_batch_step += 1
             self.validation_loss += loss
 
@@ -614,10 +758,48 @@ class SparseObjectDetModel(AbstractTrainer):
         self.writer.add_image('Validation/Input Histogram', val_images, self.epoch_step, dataformats='NHWC')
 
         if self.max_validation_accuracy < self.validation_accuracy:
+            print("new best, saving checkpoint.")
             self.max_validation_accuracy = self.validation_accuracy
+            self.saveCheckpoint(best_so_far=True)
+        else:
             self.saveCheckpoint()
 
         self.pbar.close()
+
+
+class YoloSparseObjectDetModel(SparseObjectDetModel):
+
+    def buildModel(self):
+        """Creates the specified model"""
+        self.model = SparseYolo(nr_classes=self.nr_classes, nr_input_channels=self.nr_input_channels,
+                                cnn_spatial_output_size=(
+                                    [5, 7]
+                                    if (
+                                        self.settings.dataset_name == 'NCaltech101_ObjectDetection'
+                                        or
+                                        self.settings.dataset_name == 'Kitty_ObjectDetection'
+                                    )
+                                    else [6, 8]
+                                ),
+                                batch_size=self.settings.batch_size,
+                                device=self.settings.gpu_device)
+        self.model.to(self.settings.gpu_device)
+        self.model_input_size = self.model.get_input_spacial_size()  # [191, 255]
+
+        if self.settings.use_pretrained:
+            self.loadPretrainedWeights()
+
+    def loadPretrainedWeights(self):
+        """Loads pretrained model weights"""
+        print(f"trying to load pretrained weights from '{self.settings.pretrained_sparse_yolo}'...")
+        checkpoint = torch.load(self.settings.pretrained_sparse_yolo)
+        try:
+            pretrained_dict = checkpoint['state_dict']
+        except KeyError:
+            pretrained_dict = checkpoint['model']
+
+        self.model.load_state_dict(pretrained_dict, strict=False)
+        print("checkpoint loaded successfully.")
 
 
 class DenseObjectDetModel(AbstractTrainer):
@@ -649,15 +831,36 @@ class DenseObjectDetModel(AbstractTrainer):
 
     def train(self):
         """Main training and validation loop"""
-        validation_step = 50 - 40 * (self.settings.dataset_name == 'Prophesee')
+        # validation_step = 50 - 40 * (self.settings.dataset_name == 'Prophesee')
+        validation_step = 2
 
-        while True:
+        early_stopping_counter = 0
+        early_stopping_patience = 40  # validation steps TODO
+
+        best_validation_accuracy = 0
+
+        while self.epoch_step < self.settings.max_epochs:
+            print(f"EPOCH {self.epoch_step+1}:")
             self.trainEpoch()
             if (self.epoch_step % validation_step) == (validation_step - 1):
+                print(f"VAL EPOCH:")
                 self.validationEpoch()
+                print(f"VAL ACCURACY: {self.validation_accuracy}, best={best_validation_accuracy}")
+                if self.validation_accuracy <= best_validation_accuracy:  # TODO comparing to nan always returns false
+                    early_stopping_counter += 1
+                    if early_stopping_counter >= early_stopping_patience:
+                        # early stopping
+                        print("EARLY STOPPING TRIGGERED, EXITING.")
+                        break
+                else:
+                    early_stopping_counter = 0
+                    best_validation_accuracy = self.validation_accuracy
 
             self.epoch_step += 1
             self.scheduler.step()
+
+        if self.epoch_step == self.settings.max_epochs:
+            self.saveCheckpoint()
 
     def trainEpoch(self):
         self.pbar = tqdm.tqdm(total=self.nr_train_epochs, unit='Batch', unit_scale=True)
@@ -771,6 +974,57 @@ class DenseObjectDetModel(AbstractTrainer):
 
         if self.max_validation_accuracy < self.validation_accuracy:
             self.max_validation_accuracy = self.validation_accuracy
+            self.saveCheckpoint(best_so_far=True)
+        else:
             self.saveCheckpoint()
 
         self.pbar.close()
+
+
+class YoloDenseObjectDetModel(DenseObjectDetModel):
+
+    def buildModel(self):
+        """Creates the specified model"""
+        self.model = DenseYolo(nr_classes=self.nr_classes, nr_input_channels=self.nr_input_channels,
+                                cnn_spatial_output_size=(
+                                    [5, 7]
+                                    if (
+                                        self.settings.dataset_name == 'NCaltech101_ObjectDetection'
+                                        or
+                                        self.settings.dataset_name == 'Kitty_ObjectDetection'
+                                        or
+                                        self.settings.dataset_name == 'Kitty_ObjectDetection_Image'
+                                    )
+                                    else [6, 8]
+                                ))
+        self.model.to(self.settings.gpu_device)
+        # TODO
+        model_for_input_size = SparseYolo(nr_classes=self.nr_classes, nr_input_channels=self.nr_input_channels,
+                                cnn_spatial_output_size=(
+                                    [5, 7]
+                                    if (
+                                        self.settings.dataset_name == 'NCaltech101_ObjectDetection'
+                                        or
+                                        self.settings.dataset_name == 'Kitty_ObjectDetection'
+                                        or
+                                        self.settings.dataset_name == 'Kitty_ObjectDetection_Image'
+                                    )
+                                    else [6, 8]
+                                ),
+                                device=self.settings.gpu_device)
+        self.model_input_size = model_for_input_size.get_input_spacial_size()
+
+        if self.settings.use_pretrained:
+            self.loadPretrainedWeights()
+
+    def loadPretrainedWeights(self):
+        """Loads pretrained model weights"""
+        print(f"trying to load pretrained weights from '{self.settings.pretrained_dense_yolo}'...")
+        checkpoint = torch.load(self.settings.pretrained_dense_yolo)
+        try:
+            pretrained_dict = checkpoint['state_dict']
+        except KeyError:
+            pretrained_dict = checkpoint['model']
+
+        self.model.load_state_dict(pretrained_dict, strict=False)
+        print("checkpoint loaded successfully.")

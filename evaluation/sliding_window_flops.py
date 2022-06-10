@@ -1,6 +1,6 @@
 """
 Example command:
-    python -m evaluation.sliding_window_flops --setting config/settings.yaml
+    python -m evaluation.sliding_window_flops --setting config/settings_default.yaml
     --save_dir "PATH_TO_DIR" --num_events 1 --num_samples 500
     --representation histogram  --use_multiprocessing
 """

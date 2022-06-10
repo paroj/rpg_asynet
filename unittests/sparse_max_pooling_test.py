@@ -58,8 +58,8 @@ class TestMaxPoolSync(unittest.TestCase):
         # Test with padding='valid'
         asyn_max_pool_layer_1 = ascn.asynMaxPool(dimension=dimension, filter_size=pool_size, filter_stride=pool_stride,
                                                  padding_mode='valid')
-        asyn_output = asyn_max_pool_layer_1.forward(update_location=torch.tensor(locations)[:, None],
-                                                    feature_map=torch.tensor(dense_input)[:, None])
+        asyn_output = asyn_max_pool_layer_1.forward(update_location=torch.tensor(locations)[:, None].long(),
+                                                    feature_map=torch.tensor(dense_input)[:, None].double())
         correct_output = [0, 2, 2, 3, 4]
         correct_indices = [2, 4, 4, 8, 9]
 
@@ -70,7 +70,7 @@ class TestMaxPoolSync(unittest.TestCase):
         """
         Tests if the output of one layer asynchronous Max Pooling outputs expected values.
         """
-        for i_test in tqdm.tqdm(range(100)):
+        for i_test in tqdm.tqdm(range(10)):
             # Create Input
             nIn = 4
             pool_size = 3
@@ -108,11 +108,55 @@ class TestMaxPoolSync(unittest.TestCase):
             self.assertListEqual(np.squeeze(asyn_output[1].numpy()).tolist(),
                                  np.squeeze(np_fb_output).tolist())
 
+    def test_reset_fb_sparse_maxpool(self):
+        """
+        Tests if one layer asynchronous Max Pooling can process multiple independent samples
+        """
+        nIn = 4
+        pool_size = 3
+        pool_stride = 2
+        spatial_dimensions = [5, 5]
+        padding_mode = 'valid'
+        dimension = len(spatial_dimensions)
+        fb_max_layer, asyn_max_layer = test_util.createMaxLayers(dimension, facebook_layer=True,
+                                                                 pool_size=pool_size, pool_stride=pool_stride,
+                                                                 padding_mode=padding_mode)
+        for i_test in tqdm.tqdm(range(100)):
+            # Create Input
+
+            out = test_util.createInput(nIn=nIn, spatial_dimensions=spatial_dimensions, asynchronous_input=False,
+                                        sequence_length=1, simplified=False)
+            batch_input, batch_update_locations = out
+
+            spatial_size = torch.LongTensor(batch_input.shape[:dimension])
+            select_indices = tuple(batch_update_locations.T)
+            features = batch_input[select_indices]
+            input_layer = scn.InputLayer(dimension, spatial_size, mode=3)
+            output_layer = scn.SparseToDense(dimension=dimension, nPlanes=nIn)
+
+            # Facebook implementation
+            fb_output = input_layer([torch.LongTensor(batch_update_locations), torch.FloatTensor(features)])
+            fb_output = fb_max_layer(fb_output)
+            fb_output = output_layer(fb_output)
+
+            # Asynchronous sparse implementation
+            asyn_output = asyn_max_layer.forward(update_location=torch.tensor(batch_update_locations),
+                                                 feature_map=torch.tensor(batch_input))
+
+            np_fb_output = np.squeeze(fb_output.cpu().numpy(), axis=0)
+            fb_dim = np_fb_output.ndim
+            np_fb_output = np_fb_output.transpose([i for i in range(1, fb_dim)] + [0])
+
+            asyn_max_layer.reset()
+
+            self.assertListEqual(np.squeeze(asyn_output[1].numpy()).tolist(),
+                                 np.squeeze(np_fb_output).tolist())
+
     def test_asyn_sparse_maxpool(self):
         """
         Tests if the output of one layer asynchronous Max Pooling outputs expected values.
         """
-        for i_test in tqdm.tqdm(range(100)):
+        for i_test in tqdm.tqdm(range(10)):
             # Create Input
             nIn = 128
             pool_size = 3
@@ -139,6 +183,58 @@ class TestMaxPoolSync(unittest.TestCase):
                 asyn_output = asyn_max_layer.forward(update_location=torch.tensor(asyn_update_locations[i_seq]),
                                                      feature_map=torch.tensor(asyn_input[i_seq]))
 
+            try:
+                self.assertListEqual(np.squeeze(batch_output[1].numpy()).tolist(),
+                                     np.squeeze(asyn_output[1].numpy()).tolist())
+                self.assertListEqual(np.squeeze(batch_output[2].numpy()).tolist(),
+                                     np.squeeze(asyn_output[2].numpy()).tolist())
+            except AssertionError:
+                print("Input")
+                print(np.squeeze(batch_input))
+                print("Batch Output")
+                print(torch.squeeze(batch_output[1]))
+                print("Batch Indices")
+                print(torch.squeeze(batch_output[2]))
+                print("-----")
+                print("Asyn Output")
+                print(torch.squeeze(asyn_output[1]))
+                print("Asyn Indices")
+                print(torch.squeeze(asyn_output[2]))
+
+                raise AssertionError
+
+    def test_reset_asyn_sparse_maxpool(self):
+        """
+        Tests if layers asynchronous Max Pooling layers can handle independent sequences in sequential mode.
+        """
+        # set constants
+        nIn = 128
+        pool_size = 3
+        pool_stride = 2
+        sequence_length = 20
+        spatial_dimensions = [50, 50]
+        padding_mode = 'valid'
+        dimension = len(spatial_dimensions)
+        # create layers
+        batch_max_layer, asyn_max_layer = test_util.createMaxLayers(dimension, facebook_layer=False,
+                                                                    pool_size=pool_size, pool_stride=pool_stride,
+                                                                    padding_mode=padding_mode)
+        for i_test in tqdm.tqdm(range(10)):
+            # Create Input
+            out = test_util.createInput(nIn=nIn, spatial_dimensions=spatial_dimensions, asynchronous_input=True,
+                                        sequence_length=sequence_length, simplified=False)
+            batch_input, batch_update_locations, asyn_input, asyn_update_locations = out
+            # Batch input forward
+            batch_output = batch_max_layer.forward(update_location=torch.tensor(batch_update_locations),
+                                                   feature_map=torch.tensor(batch_input))
+            # sequential input forward
+            for i_seq in range(sequence_length):
+                asyn_output = asyn_max_layer.forward(update_location=torch.tensor(asyn_update_locations[i_seq]),
+                                                     feature_map=torch.tensor(asyn_input[i_seq]))
+            # reset internal state of asyn max pool layers
+            batch_max_layer.reset()
+            asyn_max_layer.reset()
+            # check results
             try:
                 self.assertListEqual(np.squeeze(batch_output[1].numpy()).tolist(),
                                      np.squeeze(asyn_output[1].numpy()).tolist())

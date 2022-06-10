@@ -80,7 +80,7 @@ These can be configured in the `model` tag in `config/settings.yaml`.
 The following command starts the training: 
 
 ```bash
-CUDA_VISIBLE_DEVICES=<GPU_ID>, python train.py --settings_file config/settings.yaml
+CUDA_VISIBLE_DEVICES=<GPU_ID>, python train_yolo.py --settings_file config/settings_default.yaml
 ```
 
 By default, a folder with the current date and time is created in `log/` containing the corresponding tensorboard files.

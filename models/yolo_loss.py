@@ -23,9 +23,14 @@ def yoloLoss(model_output, bounding_box, input_shape):
     # Get IoU at gt_bbox_position
     bbox_detection = yoloDetect(model_output, input_shape)
     batch_indices = torch.arange(batch_s)[:, None].repeat([1, gt_nr_bbox])
+    # print(f"batch_indices: {batch_indices}")
+    # print(f"gt_cell_x: {gt_cell_x}")
+    # print(f"gt_cell_y: {gt_cell_y}")
+    # print(f"bbox_detection.shape: {bbox_detection.shape}")
     bbox_detection = bbox_detection[batch_indices, gt_cell_x, gt_cell_y, :, :]
 
     iou = computeIoU(bbox_detection[:, :, :, :4], bounding_box[:, :, :4]).detach()
+
     confidence_score, responsible_pred_bbox_idx = torch.max(iou, dim=-1)
 
     valid_gt_bbox_mask = bounding_box.sum(-1) > 0
@@ -50,8 +55,8 @@ def yoloLoss(model_output, bounding_box, input_shape):
     # ----- Object Confidence Loss -----
     # Get the predictions, which include a object and correspond to the responsible cell
     pred_conf_object = pred_conf[batch_indices, gt_cell_x, gt_cell_y, responsible_pred_bbox_idx]
-
     confidence_delta = pred_conf_object - confidence_score
+
     confidence_loss = (confidence_delta**2)[valid_gt_bbox_mask].mean()
 
     # ----- No Object Confidence Loss -----
@@ -125,11 +130,28 @@ def computeIoU(bbox_detection, gt_bbox):
     intersection_right_y = torch.min(bbox_detection[:, :, :, 1] + bbox_detection[:, :, :, 3],
                                      gt_bbox[:, :, None, 0] + gt_bbox[:, :, None, 2])
 
-    intersection_area = (intersection_right_x - intersection_left_x) * (intersection_right_y - intersection_left_y)
-    intersection_area = torch.max(intersection_area, torch.zeros_like(intersection_area))
+    # TODO bugfix
+    intersection_width = (intersection_right_x - intersection_left_x)
+    intersection_width = torch.max(intersection_width, torch.zeros_like(intersection_width))
+    intersection_height = (intersection_right_y - intersection_left_y)
+    intersection_height = torch.max(intersection_height, torch.zeros_like(intersection_height))
+    intersection_area = intersection_width * intersection_height
+    # intersection_area = (intersection_right_x - intersection_left_x) * (intersection_right_y - intersection_left_y)
+    # intersection_area = torch.max(intersection_area, torch.zeros_like(intersection_area))
+    # print("FLAG")
+    # print(bbox_detection[:, :, :, :][0][3])
+    # print(bbox_detection[:, :, :, 2:4].prod(axis=-1)[0][3])
+    # print(gt_bbox[:, :, None, :][0][3])
+    # print(gt_bbox[:, :, None, 2:4].prod(axis=-1)[0][3])
 
     union_area = bbox_detection[:, :, :, 2:4].prod(axis=-1) + gt_bbox[:, :, None, 2:4].prod(axis=-1) - \
                     intersection_area
+
+    # print("intersection_area")
+    # print(intersection_area[0][3])
+    # print("union_area")
+    # print(union_area[0][3])
+
     intersection_over_union = intersection_area.float() / (union_area.float() + 1e-9)
 
     return intersection_over_union

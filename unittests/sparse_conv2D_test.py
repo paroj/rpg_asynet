@@ -142,6 +142,59 @@ class TestConv2DSync(unittest.TestCase):
             self.assertListEqual(torch.squeeze(batch_output[1]).data.cpu().tolist(),
                                  torch.squeeze(asyn_output[1]).data.cpu().tolist())
 
+    def test_reset_sparse_convolution1d_asynchronous(self):
+        """Test for 1D convolution with one layer in a asynchronous update"""
+        print('Asynchronous 1-Layer Test')
+        # define constants
+        nIn = 4
+        nOut = 20
+        sequence_length = 13
+        use_bias = True
+        use_batch_norm = True
+        spatial_dimensions = [260, 250]
+        # create layers
+        out = test_util.createConvBatchNormLayers(1, [nIn, nOut], use_bias, use_batch_norm, dimension=2,
+                                                  facebook_layer=False)
+        batch_conv_layers, batch_conv_bn_layers, asyn_conv_layers, asyn_bn_layers = out
+        batch_conv_layer = batch_conv_layers[0]
+        asyn_conv_layer = asyn_conv_layers[0]
+        for i_test in tqdm.tqdm(range(10)):
+            # print('Test: %s' % i_test)
+            # print('#######################')
+            # print('#       New Test      #')
+            # print('#######################')
+
+            out = test_util.createInput(nIn=nIn, spatial_dimensions=spatial_dimensions, asynchronous_input=True,
+                                        sequence_length=sequence_length, simplified=False)
+            batch_input, batch_update_locations, asyn_input, asyn_update_locations = out
+            # Batch Computation
+            batch_input = torch.tensor(batch_input)
+            locations_batch = torch.tensor(batch_update_locations)
+            batch_output = batch_conv_layer.forward(update_location=locations_batch.long(),
+                                                    feature_map=batch_input.float(),
+                                                    active_sites_map=None, rule_book_input=None, rule_book_output=None)
+            if use_batch_norm:
+                self.applyBatchNorm(batch_conv_bn_layers[0], batch_output[2].clone(), batch_output[1])
+
+            # Asynchronous Update
+            for time_i in range(len(asyn_input)):
+                asyn_input_i = torch.tensor(asyn_input[time_i], dtype=torch.float32)
+                asyn_locations_i = torch.tensor(asyn_update_locations[time_i], dtype=torch.float32)
+
+                asyn_output = asyn_conv_layer.forward(update_location=asyn_locations_i.long(),
+                                                      feature_map=asyn_input_i.float(),
+                                                      active_sites_map=None, rule_book_input=None,
+                                                      rule_book_output=None)
+
+                if use_batch_norm:
+                    self.applyBatchNorm(asyn_bn_layers[0], asyn_output[2].clone(), asyn_output[1])
+            # reset state
+            batch_conv_layer.reset()
+            asyn_conv_layer.reset()
+            # check output
+            self.assertListEqual(torch.squeeze(batch_output[1]).data.cpu().tolist(),
+                                 torch.squeeze(asyn_output[1]).data.cpu().tolist())
+
     def test_sparse_convolution1d_multiple_layers(self):
         """Tests if multiple layers of asynchronous CNN result in the same output as the facebook implementation"""
         print('Batch N-Layer Test')

@@ -19,6 +19,9 @@ def yoloDetect(model_output, input_shape, threshold=None):
     """Computes the detections used in YOLO: https://arxiv.org/pdf/1506.02640.pdf"""
     cell_map_shape = torch.tensor(model_output.shape[1:3], device=model_output.device)
     cell_shape = input_shape / cell_map_shape
+    # print(f"input_shape: {input_shape}, {input_shape.shape}")
+    # print(f"cell_map_shape: {cell_map_shape}, {cell_map_shape.shape}")
+    # print(f"cell_shape: {cell_shape}, {cell_shape.shape}")
     x_norm_rel, y_norm_rel, h_norm_sqrt, w_norm_sqrt, pred_conf, pred_cls_conf = yoloParseOutput(model_output)
 
     h = h_norm_sqrt**2 * input_shape[0]
@@ -26,6 +29,8 @@ def yoloDetect(model_output, input_shape, threshold=None):
 
     x_rel = x_norm_rel * cell_shape[0]
     y_rel = y_norm_rel * cell_shape[1]
+    # print(f"x_rel: {x_rel}, {x_rel.shape}")
+    # print(f"y_rel: {y_rel}, {y_rel.shape}")
     cell_top_left = getGrid(input_shape, cell_map_shape)
 
     bbox_center = cell_top_left[None, :, :, None, :] + torch.stack([x_rel, y_rel], dim=-1)
@@ -59,7 +64,7 @@ def yoloDetect(model_output, input_shape, threshold=None):
 
 def getGrid(input_shape, cell_map_shape):
     """Constructs a 2D grid with the cell center coordinates."""
-    cell_shape = input_shape / cell_map_shape
+    cell_shape = input_shape // cell_map_shape  # torch > 1.4.0 requires integer division, else result will be float
     cell_top_left = torch.meshgrid([torch.arange(start=0, end=cell_map_shape[0]*cell_shape[0], step=cell_shape[0],
                                                  device=cell_shape.device),
                                     torch.arange(start=0, end=cell_map_shape[1]*cell_shape[1], step=cell_shape[1],

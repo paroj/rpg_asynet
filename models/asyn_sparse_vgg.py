@@ -24,7 +24,10 @@ class asynSparseVGG:
                                ['C', 64,  128], ['BNRelu'], ['C', 128, 128], ['BNRelu'], ['MP'],
                                ['C', 128, 256], ['BNRelu'], ['C', 256, 256], ['BNRelu'], ['MP'],
                                ['C', 256, 512], ['BNRelu'],
-                               ['ClassicC', 512, 256, 3, 2], ['ClassicBNRelu'], ['ClassicFC', 256*3*2, 101]]
+                               ['ClassicC', 512, 256, 3, 2],
+                               ['ClassicBNRelu'],   # scn.BatchNormReLU
+                               ['ClassicFC', 256*3*2, 101]  # scn.SparseToDense + nn.Linear
+                               ]
         self.layer_list[0][1] = input_channels
         self.layer_list[-1][2] = nr_classes
 

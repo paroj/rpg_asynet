@@ -14,6 +14,7 @@ import utils.test_util as test_util
 
 # DEVICE = torch.device("cuda:0")
 DEVICE = torch.device("cpu")
+pth = '../log/20201230-190622/checkpoints/model_step_1.pth'
 
 
 class TestSparseVGG(unittest.TestCase):
@@ -31,8 +32,7 @@ class TestSparseVGG(unittest.TestCase):
             # ---- Facebook VGG ----
             fb_model = FBSparseVGG(nr_classes).eval()
 
-            pth = 'PATH_TO_MODEL'
-            fb_model.load_state_dict(torch.load(pth, map_location={'cuda:0': 'cpu'})['model'])
+            fb_model.load_state_dict(torch.load(pth, map_location={'cuda:0': 'cpu'})['state_dict'])
 
             # ---- Create Input ----
             out = test_util.createInput(nIn=2, spatial_dimensions=[191, 255],
@@ -88,7 +88,7 @@ class TestSparseVGG(unittest.TestCase):
         spatial_dimensions = fb_model.spatial_size
 
         # ---- Create Input ----
-        dataset_path = 'PATH_TO_DATA/N-Caltech101'
+        dataset_path = '../data/N-Caltech101'
         height = 180
         width = 240
         train_dataset = NCaltech101(dataset_path, ['Motorbikes'], height, width, augmentation=False,
@@ -102,8 +102,7 @@ class TestSparseVGG(unittest.TestCase):
         locations, features = AbstractTrainer.denseToSparse(histogram)
 
         # ---- Facebook VGG ----
-        pth = 'PATH_TO_MODEL'
-        fb_model.load_state_dict(torch.load(pth, map_location={'cuda:0': 'cpu'})['model'])
+        fb_model.load_state_dict(torch.load(pth, map_location={'cuda:0': 'cpu'})['state_dict'])
 
         fb_output = fb_model([locations, features])
 
